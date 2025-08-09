@@ -44,7 +44,8 @@ def mention(user) -> str:
 
 def build_deeplink(param: str = "form") -> str:
     # param — строка до 64 символов. Можно передавать chat_id в виде "chat_-100123..."
-    return f"https://t.me/{bot.get_me().username}?start={param}"
+    return f"https://t.me/{bot.get_me().username}?start=-1002824956071
+"
 
 def welcome_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
