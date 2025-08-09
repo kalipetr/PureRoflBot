@@ -87,7 +87,6 @@ def publish_form_result(user_id: int):
         f"<b>{esc(QUESTIONS[2])}</b>\n{esc(filled[2])}\n\n"
         f"<b>{esc(QUESTIONS[3])}</b>\n{esc(filled[3])}\n\n"
         f"<b>{esc(QUESTIONS[4])}</b>\n{esc(filled[4])}\n\n"
-        f"<i>Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>"
     )
 
     try:
