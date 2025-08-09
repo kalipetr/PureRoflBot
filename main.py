@@ -70,7 +70,7 @@ def publish_form_result(user_id: int):
 
     text = (
         "🧾 <b>Короткая анкета</b>\n"
-        f"От: {mention(telebot.types.User(id=user_id, is_bot=False, first_name={nick}))}\n\n"
+        f"От: {mention(telebot.types.User(id=user_id, is_bot=False, first_name='Участник'))}\n\n"
         f"<b>{esc(QUESTIONS[0])}</b>\n{esc(filled[0])}\n\n"
         f"<b>{esc(QUESTIONS[1])}</b>\n{esc(filled[1])}\n\n"
         f"<b>{esc(QUESTIONS[2])}</b>\n{esc(filled[2])}\n\n"
