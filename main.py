@@ -15,7 +15,7 @@ DEFAULT_CHAT_ID = -1002824956071
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-# Состояние анкеты: user_id -> {progress, answers, origin_chat_id}
+# Состояние анкеты: user_id -> {progress, answers, origin_chat_id, user_obj}
 FORM_STATE = {}
 
 QUESTIONS = [
@@ -30,6 +30,7 @@ def esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def mention(user) -> str:
+    # @username если есть, иначе кликабельное имя
     if getattr(user, "username", None):
         return f"@{user.username}"
     first = esc(getattr(user, "first_name", None) or "Участник")
@@ -46,8 +47,14 @@ def welcome_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
     kb.add(InlineKeyboardButton("📎 Правила чата", url=RULES_LINK))
     return kb
 
-def start_form(user_id: int, origin_chat_id: int | None):
-    FORM_STATE[user_id] = {"progress": 0, "answers": [], "origin_chat_id": origin_chat_id}
+def start_form(user, origin_chat_id: int | None):
+    # Сохраняем сам объект пользователя, чтобы потом красиво упомянуть
+    FORM_STATE[user.id] = {
+        "progress": 0,
+        "answers": [],
+        "origin_chat_id": origin_chat_id,
+        "user_obj": user
+    }
 
 def ask_next_question(user_id: int):
     state = FORM_STATE.get(user_id)
@@ -66,22 +73,26 @@ def publish_form_result(user_id: int):
 
     answers = state["answers"]
     origin_chat_id = state.get("origin_chat_id")
+    user_obj = state.get("user_obj")
+    user_mention = mention(user_obj) if user_obj else "Участник"
+
     filled = (answers + ["—"] * len(QUESTIONS))[:len(QUESTIONS)]
 
     text = (
         "🧾 <b>Короткая анкета</b>\n"
-        f"От: {mention(telebot.types.User(id=user_id, is_bot=False, first_name='Участник'))}\n\n"
+        f"От: {user_mention}\n\n"
         f"<b>{esc(QUESTIONS[0])}</b>\n{esc(filled[0])}\n\n"
         f"<b>{esc(QUESTIONS[1])}</b>\n{esc(filled[1])}\n\n"
         f"<b>{esc(QUESTIONS[2])}</b>\n{esc(filled[2])}\n\n"
         f"<b>{esc(QUESTIONS[3])}</b>\n{esc(filled[3])}\n\n"
+        f"<b>{esc(QUESTIONS[4])}</b>\n{esc(filled[4])}\n\n"
         f"<i>Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>"
     )
 
     target_chat = origin_chat_id or DEFAULT_CHAT_ID
     try:
         bot.send_message(int(target_chat), text, disable_web_page_preview=True)
-    except Exception as e:
+    except Exception:
         # Если не удалось в чат — отправим пользователю
         bot.send_message(user_id, "Не удалось опубликовать анкету в чат, отправляю тебе:", disable_web_page_preview=True)
         bot.send_message(user_id, text, disable_web_page_preview=True)
@@ -114,7 +125,7 @@ def cmd_start(message: telebot.types.Message):
     if origin_chat_id is None:
         origin_chat_id = DEFAULT_CHAT_ID
 
-    start_form(message.from_user.id, origin_chat_id)
+    start_form(message.from_user, origin_chat_id)
     bot.reply_to(message, "Погнали! Отвечай коротко, по пунктам. Можно написать «стоп» для отмены.")
     ask_next_question(message.from_user.id)
 
@@ -123,7 +134,7 @@ def cmd_help(message):
     bot.reply_to(
         message,
         "Как это работает:\n"
-        "• Кнопка АНКЕТА открывает ЛС с ботом через deep‑link\n"
+        "• Кнопка АНКЕТА открывает ЛС с ботом через deep-link\n"
         "• По завершении анкеты публикую результат в заданный чат\n"
         f"• Текущий чат публикации: <code>{DEFAULT_CHAT_ID}</code>"
     )
@@ -132,10 +143,10 @@ def cmd_help(message):
 def greet_new_members(message: telebot.types.Message):
     for new_user in message.new_chat_members:
         kb = welcome_keyboard(chat_id=message.chat.id)
-        nick = f"@{new_user.username}" if new_user.username else (new_user.first_name or "гость")
+        nick = mention(new_user)
         bot.send_message(
             message.chat.id,
-           f"🥳 Добро пожаловать, {nick}! \n"
+            f"🥳 Добро пожаловать, {nick}! \n"
             "Здесь рофлы, мемы, флирты, лайтовое общение на взаимном уважении и оффлайн-тусовки, если поймаешь наш вайб ❤️\n\n"
             "Начинай прямо сейчас и жми <b>АНКЕТА!</b> (После перейди в личку с ботом и ответь на вопросы)\n\n"
             "Пришли фото, если ты без него - Ноунеймам здесь не рады\n\n"
