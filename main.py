@@ -1,21 +1,22 @@
 import os
 import telebot
+from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime
 
+# --- ENV ---
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не установлена")
 
-# Ссылка на сообщение с правилами
 RULES_LINK = os.getenv("RULES_LINK", "https://t.me/your_chat/42")
-
 # ФИКСИРОВАННЫЙ чат для публикации анкет (ваш ID супергруппы)
-DEFAULT_CHAT_ID = -1001173893939
+DEFAULT_CHAT_ID = int(os.getenv("DEFAULT_CHAT_ID", "-1002824956071"))
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-# Состояние анкеты: user_id -> {progress, answers, origin_chat_id, user_obj}
+# --- STATE ---
+# user_id -> {progress, answers, origin_chat_id, user_obj}
 FORM_STATE = {}
 
 QUESTIONS = [
@@ -37,18 +38,18 @@ def mention(user) -> str:
     return f"<a href='tg://user?id={user.id}'>{first}</a>"
 
 def build_deeplink(param: str = "form") -> str:
-    # param — строка до 64 символов. Мы передаём chat_id в виде "chat_-100..."
+    # deep-link для открытия ЛС с ботом
     return f"https://t.me/{bot.get_me().username}?start={param}"
 
 def welcome_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
+    # Всегда передаём chat_id, чтобы результат анкеты вернулся в этот чат
     deeplink_param = f"chat_{chat_id}" if chat_id is not None else f"chat_{DEFAULT_CHAT_ID}"
     kb.add(InlineKeyboardButton("📝 АНКЕТА", url=build_deeplink(deeplink_param)))
     kb.add(InlineKeyboardButton("📎 Правила чата", url=RULES_LINK))
     return kb
 
 def start_form(user, origin_chat_id: int | None):
-    # Сохраняем сам объект пользователя, чтобы потом красиво упомянуть
     FORM_STATE[user.id] = {
         "progress": 0,
         "answers": [],
@@ -72,7 +73,7 @@ def publish_form_result(user_id: int):
         return
 
     answers = state["answers"]
-    origin_chat_id = state.get("origin_chat_id")
+    origin_chat_id = state.get("origin_chat_id") or DEFAULT_CHAT_ID
     user_obj = state.get("user_obj")
     user_mention = mention(user_obj) if user_obj else "Участник"
 
@@ -89,9 +90,8 @@ def publish_form_result(user_id: int):
         f"<i>Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>"
     )
 
-    target_chat = origin_chat_id or DEFAULT_CHAT_ID
     try:
-        bot.send_message(int(target_chat), text, disable_web_page_preview=True)
+        bot.send_message(int(origin_chat_id), text, disable_web_page_preview=True)
     except Exception:
         # Если не удалось в чат — отправим пользователю
         bot.send_message(user_id, "Не удалось опубликовать анкету в чат, отправляю тебе:", disable_web_page_preview=True)
@@ -102,12 +102,12 @@ def publish_form_result(user_id: int):
 # ----------------- Хэндлеры -----------------
 
 @bot.message_handler(commands=['start'])
-def cmd_start(message: telebot.types.Message):
+def cmd_start(message: types.Message):
     """
     Поддерживает deep-link /start <payload>.
-    payload варианты:
+    payload:
       - "chat_<ID>"  -> начинаем анкету и публикуем результат в этот чат
-      - любое другое или пусто -> начнём анкету и опубликуем в DEFAULT_CHAT_ID
+      - другое/пусто -> начнём анкету и опубликуем в DEFAULT_CHAT_ID
     """
     payload = None
     if message.text and " " in message.text:
@@ -121,7 +121,6 @@ def cmd_start(message: telebot.types.Message):
         except ValueError:
             origin_chat_id = None
 
-    # Если не пришёл корректный chat_id — используем ваш DEFAULT_CHAT_ID
     if origin_chat_id is None:
         origin_chat_id = DEFAULT_CHAT_ID
 
@@ -134,16 +133,21 @@ def cmd_help(message):
     bot.reply_to(
         message,
         "Как это работает:\n"
-        "• Кнопка АНКЕТА открывает ЛС с ботом через deep-link\n"
+        "• Кнопка АНКЕТА открывает ЛС с ботом через deep‑link\n"
         "• По завершении анкеты публикую результат в заданный чат\n"
         f"• Текущий чат публикации: <code>{DEFAULT_CHAT_ID}</code>"
     )
 
 @bot.message_handler(content_types=['new_chat_members'])
-def greet_new_members(message: telebot.types.Message):
+def greet_new_members(message: types.Message):
+    # Классическое событие «новые участники»
     for new_user in message.new_chat_members:
         kb = welcome_keyboard(chat_id=message.chat.id)
         nick = mention(new_user)
+        extra = {}
+        # Если это форумы (темы) — отвечаем в тот же thread
+        if getattr(message, "is_topic_message", False) and getattr(message, "message_thread_id", None):
+            extra["message_thread_id"] = message.message_thread_id
         bot.send_message(
             message.chat.id,
             f"🥳 Добро пожаловать, {nick}! \n"
@@ -154,8 +158,43 @@ def greet_new_members(message: telebot.types.Message):
             "По всем вопросам обращайся @nad_wild @zhurina71 @tsvetovaan 💋\n\n"
             "Приятного общения!",
             reply_markup=kb,
+            disable_web_page_preview=True,
+            **extra
+        )
+
+@bot.chat_member_handler(func=lambda u: True)
+def on_chat_member_update(update: types.ChatMemberUpdated):
+    """
+    Срабатывает, когда статус участника меняется.
+    Ловим «вход в чат»: было left/kicked -> стало member/restricted.
+    Работает даже если join-сообщения скрыты в настройках чата.
+    """
+    try:
+        old = update.old_chat_member.status
+        new = update.new_chat_member.status
+        user = update.new_chat_member.user
+        chat_id = update.chat.id
+
+        joined_now = (old in ("left", "kicked")) and (new in ("member", "restricted"))
+        if not joined_now:
+            return
+
+        kb = welcome_keyboard(chat_id=chat_id)
+        nick = mention(user)
+        bot.send_message(
+            chat_id,
+            f"🥳 Добро пожаловать, {nick}! \n"
+            "Здесь рофлы, мемы, флирты, лайтовое общение на взаимном уважении и оффлайн-тусовки, если поймаешь наш вайб ❤️\n\n"
+            "Начинай прямо сейчас и жми <b>АНКЕТА!</b> (После перейди в личку с ботом и ответь на вопросы)\n\n"
+            "Пришли фото, если ты без него - Ноунеймам здесь не рады\n\n"
+            "И жми кномпочку <b>ПРАВИЛА</b>, чтобы быть в курсе.\n\n"
+            "По всем вопросам обращайся @nad_wild @zhurina71 @tsvetovaan 💋\n\n"
+            "Приятного общения!",
+            reply_markup=kb,
             disable_web_page_preview=True
         )
+    except Exception as e:
+        print("chat_member handler error:", e)
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower() in ["стоп", "stop", "cancel"])
 def cancel_form(message):
@@ -184,6 +223,23 @@ def private_flow(message):
         bot.send_message(user_id, "Спасибо! Публикую краткую карточку в чат ✨")
         publish_form_result(user_id)
 
+# --- START POLLING ---
 if __name__ == "__main__":
+    # На всякий случай: удаляем вебхук, чтобы точно был polling (иначе возможны конфликты)
+    try:
+        info = bot.get_webhook_info()
+        print("Current webhook url:", getattr(info, "url", ""))
+        if info and info.url:
+            bot.delete_webhook(drop_pending_updates=True)
+            print("Webhook deleted (ok for polling).")
+    except Exception as e:
+        print("webhook check/delete error:", e)
+
     print(f"Bot is starting polling as @{bot.get_me().username} ...")
-    bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
+    # Включаем поддержку обновлений статуса участников
+    bot.infinity_polling(
+        timeout=30,
+        long_polling_timeout=30,
+        skip_pending=True,
+        allowed_updates=["message", "chat_member", "my_chat_member"]
+    )
