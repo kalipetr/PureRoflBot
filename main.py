@@ -39,12 +39,12 @@ def mention(user) -> str:
     if getattr(user, "username", None):
         return f"@{user.username}"
     # кликабельное имя
-    first = esc(getattr(user, "first_name", None) or "Участник")
+    first = esc(getattr(user, "first_name", None) or {nick})
     return f"<a href='tg://user?id={user.id}'>{first}</a>"
 
 def build_deeplink(param: str = "form") -> str:
     # param — строка до 64 символов. Можно передавать chat_id в виде "chat_-100123..."
-    return f"https://t.me/{bot.get_me().username}?start="chat_-1002824956071"
+    return f"https://t.me/{bot.get_me().username}?start={param}
 "
 
 def welcome_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
