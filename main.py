@@ -11,7 +11,7 @@ if not TOKEN:
 RULES_LINK = os.getenv("RULES_LINK", "https://t.me/your_chat/42")
 
 # ФИКСИРОВАННЫЙ чат для публикации анкет (ваш ID супергруппы)
-DEFAULT_CHAT_ID = -1002824956071
+DEFAULT_CHAT_ID = -1001173893939
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
