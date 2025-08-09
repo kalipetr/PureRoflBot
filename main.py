@@ -69,6 +69,7 @@ def ask_next_question(user_id: int):
 
 def publish_form_result(user_id: int):
     state = FORM_STATE.get(user_id)
+    target_chat = origin_chat_id or DEFAULT_CHAT_ID
     if not state:
         return
 
