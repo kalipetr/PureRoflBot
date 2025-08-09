@@ -12,7 +12,7 @@ RULES_LINK = os.getenv("RULES_LINK", "https://t.me/pure_rofl_comments/994039")
 
 # Фиксированный чат для публикации анкеты, если не удалось определить origin_chat_id
 # Пример: -1001234567890 (для супергруппы). Оставьте пустым, если не хотите использовать запасной вариант.
-DEFAULT_CHAT_ID = os.getenv("DEFAULT_CHAT_ID")
+DEFAULT_CHAT_ID = os.getenv(-1002824956071)
 if DEFAULT_CHAT_ID:
     try:
         DEFAULT_CHAT_ID = int(DEFAULT_CHAT_ID)
