@@ -14,23 +14,41 @@ import yt_dlp
 import redis
 
 # =========================
-# Redis: универсальная сборка URL
+# Диагностика переменных окружения и сборка Redis URL
 # =========================
+def _clean(s: str | None) -> str:
+    if s is None:
+        return ""
+    # убираем пробелы и случайные кавычки
+    return s.strip().strip('"').strip("'")
+
 def _build_redis_url() -> str | None:
-    url = (os.getenv("REDIS_URL") or "").strip()
+    url  = _clean(os.getenv("REDIS_URL"))
+    host = _clean(os.getenv("REDIS_HOST"))
+    port = _clean(os.getenv("REDIS_PORT") or "6379")
+    pwd  = _clean(os.getenv("REDIS_PASSWORD"))
+
+    # Логи «как есть»
+    print("[ENV CHECK] REDIS_URL(raw):", re.sub(r"://([^:]+):([^@]+)@", r"://\\1:*****@", url or ""))
+    print("[ENV CHECK] REDIS_HOST:", host or "(none)", "PORT:", port or "(none)", "PASS set?:", bool(pwd))
+
+    # 1) уже валидная схема
     if url.startswith(("redis://", "rediss://", "unix://")):
         return url
 
-    host = (os.getenv("REDIS_HOST") or "").strip()
-    port = (os.getenv("REDIS_PORT") or "6379").strip()
-    pwd  = (os.getenv("REDIS_PASSWORD") or "").strip()
+    # 2) URL без схемы, но похож на host:port или user:pass@host:port
+    if url and "://" not in url and ":" in url:
+        return "redis://" + url
 
+    # 3) Собираем из HOST/PORT/PASSWORD
     if host:
-        pwd_enc = urllib.parse.quote(pwd) if pwd else ""
-        if pwd_enc:
+        if pwd:
+            pwd_enc = urllib.parse.quote(pwd)
             return f"redis://default:{pwd_enc}@{host}:{port}"
         else:
             return f"redis://{host}:{port}"
+
+    # 4) Не нашли ничего
     return None
 
 REDIS_URL = _build_redis_url()
