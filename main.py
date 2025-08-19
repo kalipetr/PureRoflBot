@@ -1,5 +1,7 @@
 import os
 import re
+import shutil
+import urllib.parse
 import telebot
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -7,41 +9,56 @@ import tempfile
 import mimetypes
 import pathlib
 from contextlib import ExitStack
-from datetime import datetime
 
 import yt_dlp
 import redis
 
-# === ENV ===
+# =========================
+# Redis: универсальная сборка URL
+# =========================
+def _build_redis_url() -> str | None:
+    url = (os.getenv("REDIS_URL") or "").strip()
+    if url.startswith(("redis://", "rediss://", "unix://")):
+        return url
+
+    host = (os.getenv("REDIS_HOST") or "").strip()
+    port = (os.getenv("REDIS_PORT") or "6379").strip()
+    pwd  = (os.getenv("REDIS_PASSWORD") or "").strip()
+
+    if host:
+        pwd_enc = urllib.parse.quote(pwd) if pwd else ""
+        if pwd_enc:
+            return f"redis://default:{pwd_enc}@{host}:{port}"
+        else:
+            return f"redis://{host}:{port}"
+    return None
+
+REDIS_URL = _build_redis_url()
+if not REDIS_URL:
+    raise RuntimeError("Не задан Redis-коннект: укажите REDIS_URL или REDIS_HOST/REDIS_PORT/REDIS_PASSWORD в Variables.")
+
+# Маскируем пароль в логах
+print("Using Redis:", re.sub(r"://([^:]+):([^@]+)@", r"://\\1:*****@", REDIS_URL))
+rds = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+# =========================
+# Telegram Bot env
+# =========================
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен")
 
 RULES_LINK = os.getenv("RULES_LINK", "https://t.me/your_chat/42")
 DEFAULT_CHAT_ID = int(os.getenv("DEFAULT_CHAT_ID", "-1002824956071"))
-BOT_FILE_LIMIT = int(os.getenv("BOT_FILE_LIMIT_MB", "45")) * 1024 * 1024
-
-REDIS_URL = os.getenv("REDIS_URL")  # обязателен для постоянного хранения cookies
-if not REDIS_URL:
-    raise RuntimeError("REDIS_URL не установлен (подключи Redis-плагин на Railway)")
-
-rds = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+BOT_FILE_LIMIT = int(os.getenv("BOT_FILE_LIMIT_MB", "45")) * 1024 * 1024  # ~45 МБ лимит на отправку
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-# === STATE (анкета в RAM, как и раньше) ===
-FORM_STATE = {}  # user_id -> {progress, answers, origin_chat_id, user_obj}
-
-QUESTIONS = [
-    "1) Как тебя зовут?",
-    "2) Сколько тебе лет?",
-    "3) Рост?",
-    "4) Из какого ты города? Если из Москвы, то из какого района?",
-    "5) (а вот тут очень важно ответить честно...) Гетеро?"
-]
-
-# ---------- Утилиты ----------
+# =========================
+# Утилиты
+# =========================
 def esc(s: str) -> str:
+    # HTML-экранирование для parse_mode=HTML
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def mention(user) -> str:
@@ -51,16 +68,29 @@ def mention(user) -> str:
     return f"<a href='tg://user?id={user.id}'>{first}</a>"
 
 def build_deeplink(param: str = "form") -> str:
+    # Откроет ЛС с ботом
     return f"https://t.me/{bot.get_me().username}?start={param}"
 
 def welcome_keyboard(chat_id: int | None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     deeplink_param = f"chat_{chat_id}" if chat_id is not None else f"chat_{DEFAULT_CHAT_ID}"
     kb.add(InlineKeyboardButton("📝 АНКЕТА", url=build_deeplink(deeplink_param)))
-    kb.add(InlineKeyboardButton("📎 Правила чата", url=RULES_LINK))
+    kb.add(InlineKeyboardButton("📎 ПРАВИЛА", url=RULES_LINK))
     return kb
 
-# ---------- Анкета ----------
+# =========================
+# Анкета
+# =========================
+QUESTIONS = [
+    "1) Как тебя зовут?",
+    "2) Сколько тебе лет?",
+    "3) Рост?",
+    "4) Из какого ты города? Если из Москвы, то из какого района?",
+    "5) (а вот тут очень важно ответить честно...) Гетеро?"
+]
+# user_id -> {progress, answers, origin_chat_id, user_obj}
+FORM_STATE: dict[int, dict] = {}
+
 def start_form(user, origin_chat_id: int | None):
     FORM_STATE[user.id] = {
         "progress": 0,
@@ -85,17 +115,16 @@ def publish_form_result(user_id: int):
         return
     answers = state["answers"]
     origin_chat_id = state.get("origin_chat_id") or DEFAULT_CHAT_ID
-    user_mention = mention(state.get("user_obj")) if state.get("user_obj") else "Участник"
+    user_obj = state.get("user_obj")
+    user_mention = mention(user_obj) if user_obj else "Участник"
+
     filled = (answers + ["—"] * len(QUESTIONS))[:len(QUESTIONS)]
     text = (
         "🧾 <b>Короткая анкета</b>\n"
-        f"От: {user_mention}\n\n"
-        f"<b>{esc(QUESTIONS[0])}</b>\n{esc(filled[0])}\n\n"
-        f"<b>{esc(QUESTIONS[1])}</b>\n{esc(filled[1])}\n\n"
-        f"<b>{esc(QUESTIONS[2])}</b>\n{esc(filled[2])}\n\n"
-        f"<b>{esc(QUESTIONS[3])}</b>\n{esc(filled[3])}\n\n"
-        f"<b>{esc(QUESTIONS[4])}</b>\n{esc(filled[4])}"
+        f"От: {user_mention}\n\n" +
+        "\n\n".join(f"<b>{esc(q)}</b>\n{esc(a)}" for q, a in zip(QUESTIONS, filled))
     )
+
     try:
         bot.send_message(int(origin_chat_id), text, disable_web_page_preview=True)
     except Exception:
@@ -103,29 +132,19 @@ def publish_form_result(user_id: int):
         bot.send_message(user_id, text, disable_web_page_preview=True)
     FORM_STATE.pop(user_id, None)
 
-# ---------- VK (cookies в Redis, работа ТОЛЬКО в ЛС) ----------
-COOKIES_KEY = "vk:cookies:{uid}"
-COOKIES_META = "vk:cookies:{uid}:meta"  # хранит {'updated_at': iso}
+# =========================
+# VK: cookies в Redis и скачивание ТОЛЬКО в ЛС
+# =========================
+def shutil_which(cmd: str) -> str | None:
+    for path in os.getenv("PATH", "").split(os.pathsep):
+        cand = os.path.join(path.strip('"'), cmd)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+        if os.path.isfile(cand + ".exe") and os.access(cand + ".exe", os.X_OK):
+            return cand + ".exe"
+    return None
 
-def save_cookies(user_id: int, text: str):
-    rds.set(COOKIES_KEY.format(uid=user_id), text)
-    rds.hset(COOKIES_META.format(uid=user_id), mapping={"updated_at": datetime.utcnow().isoformat()})
-
-def load_cookies(user_id: int) -> str | None:
-    return rds.get(COOKIES_KEY.format(uid=user_id))
-
-def clear_cookies(user_id: int):
-    rds.delete(COOKIES_KEY.format(uid=user_id))
-    rds.delete(COOKIES_META.format(uid=user_id))
-
-def cookies_status(user_id: int) -> str:
-    txt = load_cookies(user_id)
-    if not txt:
-        return "❌ cookies не загружены"
-    updated = rds.hget(COOKIES_META.format(uid=user_id), "updated_at") or "неизвестно"
-    return f"✅ cookies загружены\nОбновлены: {updated}"
-
-def _ydl_opts(tmpdir: str, cookies_text: str | None, for_audio_only: bool = False, prefer_ext: str | None = None):
+def _ydl_opts(tmpdir: str, cookies_text: str | None, audio_only: bool = False):
     opts = {
         "outtmpl": os.path.join(tmpdir, "%(title).200s.%(ext)s"),
         "restrictfilenames": True,
@@ -136,57 +155,23 @@ def _ydl_opts(tmpdir: str, cookies_text: str | None, for_audio_only: bool = Fals
         "geo_bypass": True,
         "nocheckcertificate": True,
     }
-    # Форматы:
-    if for_audio_only:
-        # Пытаемся достать чистое аудио без перекодирования
+    if audio_only:
         opts["format"] = "bestaudio/best"
-        # Если ffmpeg доступен — можно попросить конвертацию через постпроцессор:
         if shutil_which("ffmpeg"):
-            ext = prefer_ext or "mp3"
             opts["postprocessors"] = [{
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": ext,
+                "preferredcodec": "mp3",
                 "preferredquality": "0"
             }]
-        # иначе отправим как есть (opus/webm/m4a и т.д.)
     else:
         opts["format"] = "bv*+ba/best/bestaudio/bestvideo"
 
-    # cookies подсовываем через файл во временной директории
     if cookies_text:
         cpath = os.path.join(tmpdir, "cookies.txt")
         with open(cpath, "w", encoding="utf-8") as f:
             f.write(cookies_text)
         opts["cookiefile"] = cpath
     return opts
-
-def shutil_which(cmd: str) -> str | None:
-    # простая проверка наличия бинарника в PATH
-    for path in os.getenv("PATH", "").split(os.pathsep):
-        candidate = os.path.join(path.strip('"'), cmd)
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-        if os.path.isfile(candidate + ".exe") and os.access(candidate + ".exe", os.X_OK):
-            return candidate + ".exe"
-    return None
-
-def ensure_private_chat(message: types.Message) -> bool:
-    if message.chat.type == "private":
-        return True
-    bot.reply_to(
-        message,
-        "Скачивание VK доступно только в личке с ботом.\n"
-        f"Открой меня: {build_deeplink('form')}\n"
-        "Дальше: пришли ссылку VK сюда или используй команду /vk <ссылка>."
-    )
-    return False
-
-def extract_first_url(text: str) -> str | None:
-    if not text:
-        return None
-    # простенький поиск ссылки
-    m = re.search(r'(https?://[^\s]+)', text)
-    return m.group(1) if m else None
 
 def _collect_downloaded_files(info: dict) -> list[str]:
     files = []
@@ -199,8 +184,8 @@ def _collect_downloaded_files(info: dict) -> list[str]:
                     if "filepath" in rd:
                         files.append(rd["filepath"])
     else:
-        rds = info.get("requested_downloads") or []
-        for rd in rds:
+        rds_ = info.get("requested_downloads") or []
+        for rd in rds_:
             if "filepath" in rd:
                 files.append(rd["filepath"])
     return files
@@ -216,21 +201,38 @@ def _get_direct_url(info: dict) -> str | None:
             return f["url"]
     return None
 
+def ensure_private_chat(message: types.Message) -> bool:
+    if message.chat.type == "private":
+        return True
+    bot.reply_to(
+        message,
+        "Скачивание VK доступно только в личке с ботом.\n"
+        f"Открой меня: {build_deeplink('form')}\n"
+        "Дальше: пришли ссылку VK сюда или используй /vk <ссылка>."
+    )
+    return False
+
+def extract_first_url(text: str) -> str | None:
+    if not text:
+        return None
+    m = re.search(r'(https?://[^\s]+)', text)
+    return m.group(1) if m else None
+
 def handle_vk_download(dm_chat_id: int, reply_to_message_id: int | None, url: str, user_id: int, audio_only: bool = False):
-    cookies_text = load_cookies(user_id)
+    cookies_text = rds.get(f"cookies:{user_id}")  # постоянное хранение
     with tempfile.TemporaryDirectory(prefix="vkdl_") as tmpdir, ExitStack():
-        ydl_opts = _ydl_opts(tmpdir, cookies_text, for_audio_only=audio_only)
+        ydl_opts = _ydl_opts(tmpdir, cookies_text, audio_only=audio_only)
         info = None
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
         except Exception:
-            # Попробуем без скачивания — хотя бы прямую ссылку
             try:
                 with yt_dlp.YoutubeDL({**ydl_opts, "skip_download": True}) as ydl:
                     info = ydl.extract_info(url, download=False)
             except Exception:
-                bot.send_message(dm_chat_id, "Не удалось скачать с VK. Проверь ссылку/доступ или обнови cookies.", reply_to_message_id=reply_to_message_id)
+                bot.send_message(dm_chat_id, "Не удалось скачать с VK. Проверь ссылку/доступ или обнови cookies.",
+                                 reply_to_message_id=reply_to_message_id)
                 return
 
         files = _collect_downloaded_files(info)
@@ -240,7 +242,8 @@ def handle_vk_download(dm_chat_id: int, reply_to_message_id: int | None, url: st
                 bot.send_message(dm_chat_id, f"Не могу отправить файл напрямую. Ссылка на скачивание:\n{direct}",
                                  reply_to_message_id=reply_to_message_id, disable_web_page_preview=True)
             else:
-                bot.send_message(dm_chat_id, "Не удалось получить файл/ссылку VK.", reply_to_message_id=reply_to_message_id)
+                bot.send_message(dm_chat_id, "Не удалось получить файл/ссылку VK.",
+                                 reply_to_message_id=reply_to_message_id)
             return
 
         for fpath in files:
@@ -250,6 +253,7 @@ def handle_vk_download(dm_chat_id: int, reply_to_message_id: int | None, url: st
             size = p.stat().st_size
             title = p.stem.replace("_", " ")
             ext = p.suffix.lower()
+
             if size > BOT_FILE_LIMIT:
                 direct = _get_direct_url(info)
                 msg = "Файл больше лимита отправки ботом."
@@ -257,11 +261,11 @@ def handle_vk_download(dm_chat_id: int, reply_to_message_id: int | None, url: st
                     msg += f"\nСсылка на скачивание:\n{direct}"
                 bot.send_message(dm_chat_id, msg, reply_to_message_id=reply_to_message_id, disable_web_page_preview=True)
                 continue
+
             mime, _ = mimetypes.guess_type(str(p))
             try:
                 with open(p, "rb") as fh:
                     if audio_only:
-                        # всегда как аудио
                         bot.send_audio(dm_chat_id, fh, caption=title[:900], reply_to_message_id=reply_to_message_id)
                     else:
                         if ext in (".mp4", ".mkv", ".webm", ".mov") or (mime and mime.startswith("video/")):
@@ -273,8 +277,9 @@ def handle_vk_download(dm_chat_id: int, reply_to_message_id: int | None, url: st
             except Exception:
                 bot.send_message(dm_chat_id, f"Не удалось отправить файл ({p.name}).", reply_to_message_id=reply_to_message_id)
 
-# ---------- Хэндлеры ----------
-
+# =========================
+# Хэндлеры: старт/хелп, VK-команды, cookies, анкета, приветствия
+# =========================
 @bot.message_handler(commands=['start'])
 def cmd_start(message: types.Message):
     payload = None
@@ -297,29 +302,29 @@ def cmd_start(message: types.Message):
         bot.reply_to(
             message,
             "Погнали! Отвечай коротко, по пунктам. Напиши «стоп» для отмены.\n\n"
-            "💿 VK-загрузка (только здесь, в ЛС):\n"
+            "💿 VK в ЛИЧКЕ:\n"
             "• /vk <ссылка> — скачать видео/аудио\n"
             "• /vk_audio <ссылка> — только аудио (если доступен FFmpeg — конвертирую в mp3)\n"
-            "• /cookies — статус cookies; /clearcookies — забыть cookies\n"
-            "• Отправь файл cookies.txt (Netscape) — привяжу для приватных ссылок"
+            "• /cookies — статус cookies; /clearcookies — удалить cookies\n"
+            "• пришли файл cookies.txt (Netscape) — привяжу для приватных ссылок"
         )
     ask_next_question(message.from_user.id)
 
 @bot.message_handler(commands=['help'])
-def cmd_help(message):
+def cmd_help(message: types.Message):
     bot.reply_to(
         message,
         "Как это работает:\n"
         "• АНКЕТА — по кнопке в группе, отвечаешь в ЛС, результат вернётся в чат\n"
         f"• Текущий чат публикации анкет: <code>{DEFAULT_CHAT_ID}</code>\n\n"
-        "VK (только в ЛС):\n"
+        "VK (только ЛС):\n"
         "• /vk <ссылка> — скачать видео/аудио\n"
-        "• /vk_audio <ссылка> — только аудио (лучше с FFmpeg)\n"
-        "• Пришли cookies.txt (Netscape) — для приватных ссылок\n"
-        "• /cookies — статус, /clearcookies — удалить"
+        "• /vk_audio <ссылка> — только аудио\n"
+        "• /cookies — статус cookies, /clearcookies — удалить\n"
+        "• Пришли cookies.txt (Netscape) — для приватных ссылок"
     )
 
-# --- Команды VK (только ЛС) ---
+# --- VK команды (только ЛС) ---
 @bot.message_handler(commands=['vk'])
 def cmd_vk(message: types.Message):
     if not ensure_private_chat(message):
@@ -339,52 +344,49 @@ def cmd_vk_audio(message: types.Message):
     if not url or "vk.com" not in url:
         bot.reply_to(message, "Пришли так: <code>/vk_audio https://vk.com/video...</code>")
         return
-    has_ffmpeg = bool(shutil_which("ffmpeg"))
-    if not has_ffmpeg:
-        bot.reply_to(message, "FFmpeg не обнаружен — пришлю лучшую аудиодорожку как есть (без конвертации).")
+    if not shutil_which("ffmpeg"):
+        bot.reply_to(message, "FFmpeg не найден — пришлю лучшую аудиодорожку как есть.")
     else:
         bot.reply_to(message, "Пробую вытащить аудио (FFmpeg)…")
     handle_vk_download(message.chat.id, message.message_id, url, message.from_user.id, audio_only=True)
 
+# --- Cookies management (только ЛС) ---
 @bot.message_handler(commands=['cookies'])
 def cmd_cookies_status(message: types.Message):
     if message.chat.type != "private":
         return
-    bot.reply_to(message, cookies_status(message.from_user.id))
+    has = bool(rds.get(f"cookies:{message.from_user.id}"))
+    bot.reply_to(message, "✅ cookies загружены" if has else "❌ cookies не загружены")
 
 @bot.message_handler(commands=['clearcookies'])
 def cmd_clear_cookies(message: types.Message):
     if message.chat.type != "private":
         return
-    clear_cookies(message.from_user.id)
+    rds.delete(f"cookies:{message.from_user.id}")
     bot.reply_to(message, "Готово. Cookies удалены.")
 
-# --- Приём cookies.txt в ЛС ---
 @bot.message_handler(content_types=['document'])
 def on_document(message: types.Message):
     if message.chat.type != "private":
         return
     doc = message.document
     fname = (doc.file_name or "").lower()
-    # принимаем любой .txt, где встречаются домены VK
-    try_txt = fname.endswith(".txt")
-    if not try_txt:
-        bot.reply_to(message, "Если хочешь настроить приватный VK, пришли файл cookies.txt (Netscape формат).")
+    if not fname.endswith(".txt"):
+        bot.reply_to(message, "Пришли файл cookies.txt (Netscape формат).")
         return
     try:
         file_info = bot.get_file(doc.file_id)
         file_data = bot.download_file(file_info.file_path)
         text = file_data.decode("utf-8", errors="ignore")
-        # лёгкая валидация: должна быть строка "Netscape" или домены .vk.com
         if "Netscape" not in text and ".vk.com" not in text and "vk.com" not in text:
             bot.reply_to(message, "Похоже, это не cookies.txt (Netscape). Проверь файл.")
             return
-        save_cookies(message.from_user.id, text)
+        rds.set(f"cookies:{message.from_user.id}", text)
         bot.reply_to(message, "Cookies приняты ✅ Теперь пришли приватную VK‑ссылку.")
     except Exception:
         bot.reply_to(message, "Не удалось обработать файл cookies.txt. Попробуй ещё раз.")
 
-# --- Приветствия в группе ---
+# --- Приветствия (группы + скрытые join-сообщения) ---
 @bot.message_handler(content_types=['new_chat_members'])
 def greet_new_members(message: types.Message):
     for new_user in message.new_chat_members:
@@ -434,6 +436,7 @@ def on_chat_member_update(update: types.ChatMemberUpdated):
     except Exception as e:
         print("chat_member handler error:", e)
 
+# --- Анкета: отмена / шаги в ЛС ---
 @bot.message_handler(func=lambda m: m.text and m.text.lower() in ["стоп", "stop", "cancel"])
 def cancel_form(message: types.Message):
     user_id = message.from_user.id
@@ -452,7 +455,7 @@ def private_flow(message: types.Message):
         kb.add(InlineKeyboardButton("📝 Начать анкету", url=build_deeplink(f"chat_{DEFAULT_CHAT_ID}")))
         bot.reply_to(message, "Хочешь заполнить короткую анкету?", reply_markup=kb)
         return
-    state["answers"].append(message.text.strip())
+    state["answers"].append((message.text or "").strip())
     state["progress"] += 1
     if state["progress"] < len(QUESTIONS):
         ask_next_question(user_id)
@@ -460,15 +463,15 @@ def private_flow(message: types.Message):
         bot.send_message(user_id, "Спасибо! Публикую краткую карточку в чат ✨")
         publish_form_result(user_id)
 
-# --- START POLLING ---
+# =========================
+# Старт
+# =========================
 if __name__ == "__main__":
-    # Удаляем вебхук на всякий случай
     try:
         info = bot.get_webhook_info()
-        print("Current webhook url:", getattr(info, "url", ""))
         if info and info.url:
             bot.delete_webhook(drop_pending_updates=True)
-            print("Webhook deleted (ok for polling).")
+            print("Webhook deleted (polling mode).")
     except Exception as e:
         print("webhook check/delete error:", e)
 
